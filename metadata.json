@@ -1,0 +1,7 @@
+{
+  "name": "PolyTrack RL Optimizer",
+  "description": "A visualization dashboard for optimizing racing tracks using simulated Reinforcement Learning and Gemini API for trajectory analysis.",
+  "requestFramePermissions": [
+    "display-capture"
+  ]
+}
