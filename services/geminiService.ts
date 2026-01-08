@@ -33,7 +33,7 @@ export const getOptimizedRacingLine = async (track: TrackData): Promise<Point[]>
 
   try {
     const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
+      model: 'gemini-3-pro-preview',
       contents: prompt,
       config: {
         responseMimeType: "application/json",
@@ -66,7 +66,6 @@ export const getOptimizedRacingLine = async (track: TrackData): Promise<Point[]>
     return points;
   } catch (error) {
     console.error("Error calling Gemini:", error);
-    // Fallback to center line if AI fails to prevent app crash
     return track.center;
   }
 };
@@ -85,7 +84,7 @@ export const analyzeTrackStrategy = async (track: TrackData): Promise<string> =>
 
   try {
     const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
+      model: 'gemini-3-flash-preview',
       contents: prompt,
     });
     return response.text || "No analysis generated.";
@@ -98,12 +97,11 @@ export const analyzeTrackStrategy = async (track: TrackData): Promise<string> =>
 export const extractTrackFromImage = async (base64Image: string): Promise<TrackData> => {
   if (!process.env.API_KEY) throw new Error("API Key missing");
 
-  // Remove data URL prefix if present to get pure base64
   const base64Data = base64Image.replace(/^data:image\/(png|jpeg|jpg);base64,/, '');
 
   try {
     const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
+      model: 'gemini-3-pro-preview',
       contents: {
         parts: [
           {
@@ -114,17 +112,13 @@ export const extractTrackFromImage = async (base64Image: string): Promise<TrackD
           },
           {
             text: `
-              Analyze this image of a race track (top-down view).
-              Identify the drivable track surface.
+              Analyze this image of a race track.
+              Reconstruct the geometry into three arrays of coordinates (0-800 for x, 0-600 for y).
+              1. 'outer': Points defining the outer edge.
+              2. 'inner': Points defining the inner island.
+              3. 'center': Points defining the center line.
               
-              I need you to approximate the track geometry into three arrays of coordinates (0-800 for x, 0-600 for y).
-              1. 'outer': Points defining the outer edge of the track.
-              2. 'inner': Points defining the inner island/hole of the track.
-              3. 'center': Points defining the center line of the track.
-              
-              Ensure the 'outer' and 'inner' arrays form closed loops.
-              Scale the coordinates to fit within an 800x600 canvas, maintaining aspect ratio.
-              Ensure there are at least 15 points per array for smoothness.
+              Ensure loops are closed and smooth.
             `
           }
         ]
@@ -165,19 +159,82 @@ export const extractTrackFromImage = async (base64Image: string): Promise<TrackD
     });
 
     const result = JSON.parse(response.text || "{}");
-    
-    // Strict Validation
-    if (!result.outer || !result.inner || !result.center) {
-      throw new Error("Incomplete track data received");
-    }
-    
-    if (!validatePoints(result.outer) || !validatePoints(result.inner) || !validatePoints(result.center)) {
-        throw new Error("Track data contains invalid coordinates (non-numeric x/y)");
-    }
-
+    if (!result.outer || !result.inner || !result.center) throw new Error("Incomplete track data");
     return result as TrackData;
   } catch (error) {
     console.error("Error extracting track from image:", error);
+    throw error;
+  }
+};
+
+export const extractTrackFromCode = async (trackCode: string): Promise<TrackData> => {
+  if (!process.env.API_KEY) throw new Error("API Key missing");
+
+  const prompt = `
+    You are an expert at reverse-engineering game map serialization strings. 
+    This is a "PolyTrack" map code: 
+    
+    ${trackCode}
+    
+    This string contains the encoded tiles, rotations, and placement of a race track. 
+    Interpret the logical shape represented by this code and output high-fidelity coordinate-based geometry for a 2D canvas (800x600).
+    
+    You must provide:
+    1. 'outer': The closed loop boundary points of the track exterior.
+    2. 'inner': The closed loop boundary points of the track interior (the "hole").
+    3. 'center': The ideal center line of the drivable surface.
+    
+    Requirements:
+    - Points should be in (x,y) format.
+    - Coordinate range: x [0, 800], y [0, 600].
+    - Ensure at least 30 points per array for high precision.
+    - The track must be a continuous, valid circuit.
+  `;
+
+  try {
+    const response = await ai.models.generateContent({
+      model: 'gemini-3-pro-preview',
+      contents: prompt,
+      config: {
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            outer: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: { x: { type: Type.NUMBER }, y: { type: Type.NUMBER } },
+                required: ["x", "y"]
+              }
+            },
+            inner: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: { x: { type: Type.NUMBER }, y: { type: Type.NUMBER } },
+                required: ["x", "y"]
+              }
+            },
+            center: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: { x: { type: Type.NUMBER }, y: { type: Type.NUMBER } },
+                required: ["x", "y"]
+              }
+            }
+          },
+          required: ["outer", "inner", "center"]
+        }
+      }
+    });
+
+    const result = JSON.parse(response.text || "{}");
+    if (!result.outer || !result.inner || !result.center) throw new Error("Failed to parse track code into geometry.");
+    return result as TrackData;
+  } catch (error) {
+    console.error("Error decoding track code:", error);
     throw error;
   }
 };

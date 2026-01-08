@@ -1,12 +1,11 @@
-
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import TrackCanvas from './components/TrackCanvas';
 import StatsPanel from './components/StatsPanel';
 import { INITIAL_TRACK, AGENT_COUNT } from './constants';
 import { TrackData, SimulationState, Agent, Point, ChartDataPoint, SavedRun } from './types';
-import { getOptimizedRacingLine, analyzeTrackStrategy, extractTrackFromImage } from './services/geminiService';
+import { getOptimizedRacingLine, analyzeTrackStrategy, extractTrackFromImage, extractTrackFromCode } from './services/geminiService';
 import { saveRun, getRunsForTrack, deleteRun, generateTrackSignature } from './services/storageService';
-import { Play, Pause, Zap, RotateCcw, Cpu, ScanEye, Gamepad2, LayoutTemplate, Cast, MonitorPlay, Save, Database, Trash2, Ghost } from 'lucide-react';
+import { Play, Pause, Zap, Cpu, ScanEye, LayoutTemplate, Cast, MonitorPlay, Save, Database, Trash2, Ghost, Hash, X, Loader2 } from 'lucide-react';
 
 // Helper to interpolate between two points
 const lerp = (p1: Point, p2: Point, t: number): Point => {
@@ -19,10 +18,9 @@ const lerp = (p1: Point, p2: Point, t: number): Point => {
 
 // Helper to get point on a path at t (0-1)
 const getPointOnPath = (path: Point[], t: number): Point => {
-  if (!path || path.length === 0) return { x: 400, y: 300 }; // Default center
+  if (!path || path.length === 0) return { x: 400, y: 300 };
   
   const totalPoints = path.length;
-  // Handle single point case
   if (totalPoints === 1) return path[0];
 
   const scaledT = t * totalPoints;
@@ -33,7 +31,6 @@ const getPointOnPath = (path: Point[], t: number): Point => {
   const p1 = path[index];
   const p2 = path[nextIndex];
 
-  // Safety guard if points are missing
   if (!p1 || !p2) return path[0] || { x: 400, y: 300 };
 
   return lerp(p1, p2, segmentT);
@@ -48,8 +45,12 @@ export default function App() {
   const [geminiAnalysis, setGeminiAnalysis] = useState<string>("");
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [isScanning, setIsScanning] = useState(false);
+  const [isDecoding, setIsDecoding] = useState(false);
   
   const [showGame, setShowGame] = useState(true);
+  const [showCodeInput, setShowCodeInput] = useState(false);
+  const [trackCode, setTrackCode] = useState("");
+  
   const videoRef = useRef<HTMLVideoElement>(null);
   const [visionStream, setVisionStream] = useState<MediaStream | null>(null);
   const [, setTick] = useState(0);
@@ -111,10 +112,7 @@ export default function App() {
     initAgents();
   }, [initAgents]);
 
-  // Handle Saving Best Run
   const handleSaveBestRun = () => {
-    // Find best agent roughly (simplistic: highest reward or optimal path if set)
-    // For now, we save the "Optimal Path" if it exists, otherwise the best agent's path.
     const path = optimalPath || (simState.agents.length > 0 ? simState.agents[0].path : track.center);
     
     const newRun: SavedRun = {
@@ -133,19 +131,17 @@ export default function App() {
   };
 
   const handleLoadRun = (run: SavedRun) => {
-    // Set this path as optimal target
     setOptimalPath(run.path);
     setTargetPath(run.path);
     
-    // Create Ghost Agent
     const startPoint = run.path[0];
     const ghost: Agent = {
         id: -1,
         position: startPoint,
         path: run.path,
-        color: '#fbbf24', // Amber/Gold
+        color: '#fbbf24', 
         progress: 0,
-        speed: 0.008, // Fixed ideal speed or derived from laptime?
+        speed: 0.008, 
         crashed: false,
         angle: 0
     };
@@ -157,9 +153,27 @@ export default function App() {
       setSavedRuns(getRunsForTrack(track));
   };
 
+  const handleLoadTrackCode = async () => {
+      if (!trackCode.trim()) return;
+      setIsDecoding(true);
+      try {
+          const newTrack = await extractTrackFromCode(trackCode);
+          setTrack(newTrack);
+          setTargetPath(newTrack.center);
+          setOptimalPath(null);
+          setGeminiAnalysis(`Track reconstructed from code [${trackCode.substring(0, 15)}...]`);
+          setShowCodeInput(false);
+          setTrackCode("");
+          initAgents();
+      } catch (e) {
+          alert("Failed to decode track code. Ensure it is a valid PolyTrack string.");
+      } finally {
+          setIsDecoding(false);
+      }
+  };
+
   // Simulation Loop
   const updateSimulation = useCallback(() => {
-    // 1. Update Ghost Agent (Always runs if exists)
     if (ghostAgent) {
         setGhostAgent(prev => {
             if (!prev) return null;
@@ -167,7 +181,6 @@ export default function App() {
             if (nextProgress >= 1) nextProgress = 0;
             
             const targetP = getPointOnPath(prev.path, nextProgress);
-            // Ghost moves perfectly on path
             const dx = targetP.x - prev.position.x;
             const dy = targetP.y - prev.position.y;
             const angle = Math.atan2(dy, dx);
@@ -202,9 +215,7 @@ export default function App() {
         const noiseX = (Math.random() - 0.5) * (20 * (1 - learningFactor));
         const noiseY = (Math.random() - 0.5) * (20 * (1 - learningFactor));
 
-        // Ensure agent.position is valid
         const currentPos = agent.position || { x: 0, y: 0 };
-        
         const lerpedPos = lerp(currentPos, targetP, 0.1);
 
         const newPos = {
@@ -212,7 +223,6 @@ export default function App() {
             y: lerpedPos.y + noiseY
         };
 
-        // Calculate Angle
         const dx = newPos.x - currentPos.x;
         const dy = newPos.y - currentPos.y;
         const angle = Math.atan2(dy, dx);
@@ -271,13 +281,15 @@ export default function App() {
     }
   }, [updateSimulation]);
 
-  // Handle Vision Connect
   const handleConnectVision = async () => {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+          alert("Your browser does not support screen sharing.");
+          return;
+      }
+
       try {
           const stream = await navigator.mediaDevices.getDisplayMedia({
-              video: {
-                  cursor: "always"
-              } as any,
+              video: true,
               audio: false
           });
           setVisionStream(stream);
@@ -285,12 +297,14 @@ export default function App() {
               videoRef.current.srcObject = stream;
               videoRef.current.play();
           }
+          
+          stream.getVideoTracks()[0].onended = () => {
+              handleStopVision();
+          };
 
-          // Auto-scan track after 2 seconds to let stream settle
           setIsScanning(true);
           setTimeout(async () => {
               if (videoRef.current) {
-                // Draw current frame to a temp canvas to get base64
                 const tempCanvas = document.createElement('canvas');
                 tempCanvas.width = videoRef.current.videoWidth || 800;
                 tempCanvas.height = videoRef.current.videoHeight || 600;
@@ -317,12 +331,15 @@ export default function App() {
 
       } catch (err: any) {
           console.error("Error connecting vision:", err);
-          if (err.name === 'NotAllowedError') {
-             alert("Screen sharing permission was denied. Please allow sharing to use Vision features.");
-          } else if (err.toString().includes("display-capture")) {
+          if (err.name === 'NotAllowedError' || err.message === 'Permission denied' || err.message === 'Permission denied by user') {
+             console.log("User cancelled screen sharing.");
+             return;
+          }
+
+          if (err.toString().includes("display-capture")) {
              alert("Screen sharing is blocked by the environment policy. Try opening this app in a new separate tab.");
           } else {
-             alert(`Failed to connect screen share: ${err.message}`);
+             alert(`Failed to connect screen share: ${err.message || 'Unknown error'}`);
           }
       }
   };
@@ -331,15 +348,14 @@ export default function App() {
       if (visionStream) {
           visionStream.getTracks().forEach(track => track.stop());
           setVisionStream(null);
+          if (videoRef.current) {
+              videoRef.current.srcObject = null;
+          }
       }
   };
 
   const handleStartStop = () => {
     setSimState(prev => ({ ...prev, isRunning: !prev.isRunning }));
-  };
-
-  const handleReset = () => {
-    initAgents();
   };
 
   const handleGeminiOptimize = async () => {
@@ -348,20 +364,14 @@ export default function App() {
         return;
     }
     setIsAnalyzing(true);
-    
-    // 1. Get Analysis
     const analysis = await analyzeTrackStrategy(track);
     setGeminiAnalysis(analysis);
-
-    // 2. Get Racing Line
     const optimizedPoints = await getOptimizedRacingLine(track);
     setOptimalPath(optimizedPoints);
     setTargetPath(optimizedPoints);
-
     setIsAnalyzing(false);
   };
 
-  // Paste handler
   useEffect(() => {
     const handlePaste = async (e: ClipboardEvent) => {
       const items = e.clipboardData?.items;
@@ -403,14 +413,12 @@ export default function App() {
   return (
     <div className="flex h-screen w-full bg-slate-950 text-slate-200 overflow-hidden font-sans">
       
-      {/* Hidden Video for processing */}
       <video ref={videoRef} className="hidden" muted playsInline />
 
-      {/* External Game View (Iframe) */}
       <div className={`${showGame ? 'w-1/2' : 'w-0'} bg-black transition-all duration-300 ease-in-out border-r border-slate-800 relative`}>
         <div className="absolute top-0 left-0 w-full h-full flex flex-col items-center justify-center text-slate-500 z-0">
           <p className="mb-2">Loading PolyTrack...</p>
-          <p className="text-xs max-w-xs text-center">Open <strong>kodub.com/apps/polytrack</strong> in a separate window and click "Connect Vision" for best results.</p>
+          <p className="text-xs max-w-xs text-center">Paste track code or use "Connect Vision" to optimize.</p>
         </div>
         <iframe 
           src="https://kodub.com/apps/polytrack" 
@@ -420,10 +428,8 @@ export default function App() {
         />
       </div>
 
-      {/* Optimizer Dashboard */}
       <div className={`${showGame ? 'w-1/2' : 'w-full'} flex flex-col h-full transition-all duration-300 relative`}>
         
-        {/* Header / Controls */}
         <div className="h-16 border-b border-slate-800 flex items-center px-6 justify-between bg-slate-900 z-20 relative">
           <div className="flex items-center gap-4">
              <button 
@@ -442,46 +448,66 @@ export default function App() {
 
           <div className="flex items-center gap-2">
              <button
+                onClick={() => setShowCodeInput(!showCodeInput)}
+                className={`flex items-center gap-2 px-3 py-2 text-sm font-bold rounded-lg transition-all border ${showCodeInput ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/50' : 'bg-slate-800 hover:bg-slate-700 text-slate-300 border-slate-700'}`}
+                title="Paste Track Code"
+             >
+                <Hash size={16} /> Code
+             </button>
+
+             <button
                 onClick={() => setShowDatabase(!showDatabase)}
-                className={`flex items-center gap-2 px-4 py-2 text-sm font-bold rounded-lg transition-all border ${showDatabase ? 'bg-indigo-500/10 text-indigo-400 border-indigo-500/50' : 'bg-slate-800 hover:bg-slate-700 text-slate-300 border-slate-700'}`}
+                className={`flex items-center gap-2 px-3 py-2 text-sm font-bold rounded-lg transition-all border ${showDatabase ? 'bg-indigo-500/10 text-indigo-400 border-indigo-500/50' : 'bg-slate-800 hover:bg-slate-700 text-slate-300 border-slate-700'}`}
              >
                 <Database size={16} /> Data
              </button>
 
              {visionStream ? (
-                <button 
-                    onClick={handleStopVision}
-                    className="flex items-center gap-2 px-4 py-2 bg-rose-500/10 text-rose-500 hover:bg-rose-500/20 text-sm font-bold rounded-lg transition-all border border-rose-500/50"
-                >
+                <button onClick={handleStopVision} className="flex items-center gap-2 px-3 py-2 bg-rose-500/10 text-rose-500 hover:bg-rose-500/20 text-sm font-bold rounded-lg border border-rose-500/50">
                     <Cast size={16} /> Stop Vision
                 </button>
              ) : (
-                <button 
-                    onClick={handleConnectVision}
-                    className="flex items-center gap-2 px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 text-sm font-bold rounded-lg transition-all border border-slate-700"
-                >
-                    <MonitorPlay size={16} /> Connect Vision
+                <button onClick={handleConnectVision} className="flex items-center gap-2 px-3 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 text-sm font-bold rounded-lg border border-slate-700">
+                    <MonitorPlay size={16} /> Vision
                 </button>
              )}
 
-            <button 
-                onClick={handleGeminiOptimize}
-                disabled={isAnalyzing || isScanning}
-                className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-sm font-bold rounded-lg transition-all disabled:opacity-50"
-            >
-                {isAnalyzing ? <span className="animate-pulse">Optimizing...</span> : <><Zap size={16} /> Optimize</>}
+            <button onClick={handleGeminiOptimize} disabled={isAnalyzing || isScanning || isDecoding} className="flex items-center gap-2 px-3 py-2 bg-blue-600 hover:bg-blue-500 text-white text-sm font-bold rounded-lg disabled:opacity-50">
+                {isAnalyzing ? <Loader2 size={16} className="animate-spin" /> : <Zap size={16} />} Optimize
             </button>
-            <button 
-                onClick={handleStartStop}
-                className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-bold transition-all ${simState.isRunning ? 'bg-amber-500/10 text-amber-500' : 'bg-emerald-600 text-white'}`}
-            >
+            <button onClick={handleStartStop} className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-bold transition-all ${simState.isRunning ? 'bg-amber-500/10 text-amber-500' : 'bg-emerald-600 text-white'}`}>
                 {simState.isRunning ? <Pause size={16} /> : <Play size={16} />}
                 {simState.isRunning ? "Pause" : "Start"}
             </button>
           </div>
         </div>
 
-        {/* Database Drawer */}
+        {/* Track Code Input Overlay */}
+        {showCodeInput && (
+            <div className="absolute top-16 left-0 right-0 p-6 bg-slate-900 border-b border-slate-800 z-40 shadow-xl flex flex-col gap-3 animate-in fade-in slide-in-from-top-4 duration-300">
+                <div className="flex justify-between items-center">
+                    <h3 className="text-sm font-bold text-slate-300 flex items-center gap-2"><Hash size={14} /> Import PolyTrack Code</h3>
+                    <button onClick={() => setShowCodeInput(false)} className="p-1 hover:bg-slate-800 rounded text-slate-500"><X size={16} /></button>
+                </div>
+                <div className="flex gap-2">
+                    <textarea 
+                        value={trackCode}
+                        onChange={(e) => setTrackCode(e.target.value)}
+                        placeholder="Paste map data string here (starts with PolyTrack...)"
+                        className="flex-1 bg-slate-950 border border-slate-800 rounded-lg p-3 text-xs font-mono text-emerald-400 focus:outline-none focus:border-emerald-500/50 transition-colors h-24 resize-none"
+                    />
+                </div>
+                <button 
+                    onClick={handleLoadTrackCode}
+                    disabled={isDecoding || !trackCode.trim()}
+                    className="w-full py-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-bold rounded-lg flex items-center justify-center gap-2 text-sm"
+                >
+                    {isDecoding ? <Loader2 size={16} className="animate-spin" /> : <Database size={16} />}
+                    {isDecoding ? "Decoding Map Data..." : "Load Map Geometry"}
+                </button>
+            </div>
+        )}
+
         <div className={`absolute top-16 right-0 w-80 h-[calc(100%-4rem)] bg-slate-900 border-l border-slate-800 transform transition-transform duration-300 z-30 shadow-2xl ${showDatabase ? 'translate-x-0' : 'translate-x-full'}`}>
            <div className="p-4 border-b border-slate-800 flex justify-between items-center">
               <h3 className="font-bold flex items-center gap-2"><Database size={16} /> Saved Runs</h3>
@@ -510,16 +536,10 @@ export default function App() {
                              </div>
                           </div>
                           <div className="flex gap-2 mt-2">
-                             <button 
-                                onClick={() => handleLoadRun(run)}
-                                className="flex-1 bg-indigo-600 hover:bg-indigo-500 text-white text-xs py-1.5 rounded flex items-center justify-center gap-1"
-                             >
+                             <button onClick={() => handleLoadRun(run)} className="flex-1 bg-indigo-600 hover:bg-indigo-500 text-white text-xs py-1.5 rounded flex items-center justify-center gap-1">
                                 <Ghost size={12} /> Load Ghost
                              </button>
-                             <button 
-                                onClick={() => handleDeleteRun(run.id)}
-                                className="p-1.5 bg-slate-700 hover:bg-rose-500/20 hover:text-rose-500 text-slate-400 rounded transition-colors"
-                             >
+                             <button onClick={() => handleDeleteRun(run.id)} className="p-1.5 bg-slate-700 hover:bg-rose-500/20 hover:text-rose-500 text-slate-400 rounded transition-colors">
                                 <Trash2 size={12} />
                              </button>
                           </div>
@@ -529,15 +549,16 @@ export default function App() {
            </div>
         </div>
 
-        {/* Content Area */}
         <div className="flex-1 flex flex-col p-6 gap-6 overflow-hidden relative">
           
-          {/* Scanning Overlay */}
-          {isScanning && (
+          {(isScanning || isDecoding) && (
             <div className="absolute inset-0 z-50 bg-slate-950/80 backdrop-blur flex flex-col items-center justify-center">
-                <ScanEye size={48} className="text-emerald-400 animate-pulse mb-4" />
-                <h3 className="text-xl font-bold text-white">Scanning Track Geometry...</h3>
-                <p className="text-slate-400">Gemini is analyzing the track from the game feed</p>
+                <div className="relative">
+                    <ScanEye size={48} className="text-emerald-400 animate-pulse mb-4" />
+                    <Loader2 size={64} className="text-emerald-500/30 animate-spin absolute inset-0 -m-2" />
+                </div>
+                <h3 className="text-xl font-bold text-white">{isScanning ? 'Scanning Feed...' : 'Reverse Engineering Code...'}</h3>
+                <p className="text-slate-400">{isScanning ? 'Extracting geometry from pixels' : 'Gemini is interpreting map serialization'}</p>
             </div>
           )}
 
@@ -550,7 +571,6 @@ export default function App() {
                 videoElement={videoRef.current}
                 ghostAgent={ghostAgent}
             />
-            {/* Legend */}
             <div className="absolute bottom-4 left-4 flex flex-col gap-2 text-[10px] text-slate-500 font-mono pointer-events-none bg-slate-900/80 p-2 rounded backdrop-blur">
                 <div className="flex items-center gap-2"><div className="w-2 h-2 rounded-full bg-emerald-500"></div> Optimal Line (AI)</div>
                 <div className="flex items-center gap-2"><div className="w-2 h-2 rounded-full bg-rose-500 opacity-50"></div> Current Best Policy</div>
